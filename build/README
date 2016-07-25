@@ -1,0 +1,17 @@
+[INFO] main: Packages created:
+[INFO] main: telegraf-0.13.0-1-gc976bcc~c976bcc_linux_amd64.tar.gz (MD5=5aac9cbd5053169f7e77b945ffec5aa5)
+[INFO] main: telegraf_0.13.0-1-gc976bcc~c976bcc_amd64.deb (MD5=b97ffb882dd05882ede362202a61b3db)
+[INFO] main: telegraf-0.13.0_1_gc976bcc~c976bcc.x86_64.rpm (MD5=7732df316131d03d516fc7d2e6b66338)
+
+[INFO] main: telegraf_0.13.0-1-gc976bcc~c976bcc_arm64.deb (MD5=4c44fb58a588a8d13672f6c3f0716511)
+[INFO] main: telegraf-0.13.0_1_gc976bcc~c976bcc.arm64.rpm (MD5=9c6974e01d2cf013cc72368fcfc56ca0)
+[INFO] main: telegraf-0.13.0-1-gc976bcc~c976bcc_linux_arm64.tar.gz (MD5=66e06a88a557316a79eeb43a147e942b)
+[INFO] main: telegraf_0.13.0-1-gc976bcc~c976bcc_i386.deb (MD5=01fe5ffa9e6dbfb29b78e7043526537c)
+[INFO] main: telegraf-0.13.0_1_gc976bcc~c976bcc.i386.rpm (MD5=a1d13a5425442bc168191bd7787ae2b9)
+[INFO] main: telegraf-0.13.0-1-gc976bcc~c976bcc_linux_i386.tar.gz (MD5=1e10019a193cd64f32972d58f2f73ace)
+[INFO] main: telegraf_0.13.0-1-gc976bcc~c976bcc_armel.deb (MD5=e6f967d8286ff377cb1edeb951c6c3c2)
+[INFO] main: telegraf-0.13.0_1_gc976bcc~c976bcc.armel.rpm (MD5=636c822673ad07b9371a885a013d95a7)
+[INFO] main: telegraf-0.13.0-1-gc976bcc~c976bcc_linux_armel.tar.gz (MD5=676713ecffe8286c127105874fa3ded6)
+[INFO] main: telegraf_0.13.0-1-gc976bcc~c976bcc_armhf.deb (MD5=95a31d9ec0d7d21ac8ea134e10442a7c)
+[INFO] main: telegraf-0.13.0_1_gc976bcc~c976bcc.armhf.rpm (MD5=03d69334aab5e12739a86d14cbde507e)
+[INFO] main: telegraf-0.13.0-1-gc976bcc~c976bcc_linux_armhf.tar.gz (MD5=318f73da49c659d94bc18fa6511aceb2)

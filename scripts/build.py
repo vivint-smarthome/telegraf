@@ -343,46 +343,46 @@ def check_prereqs():
     return True
 
 def upload_packages(packages, bucket_name=None, overwrite=False):
-    """Upload provided package output to AWS S3.
-    """
-    logging.debug("Uploading files to bucket '{}': {}".format(bucket_name, packages))
-    try:
-        import boto
-        from boto.s3.key import Key
-        from boto.s3.connection import OrdinaryCallingFormat
-        logging.getLogger("boto").setLevel(logging.WARNING)
-    except ImportError:
-        logging.warn("Cannot upload packages without 'boto' Python library!")
-        return False
-    logging.info("Connecting to AWS S3...")
-    # Up the number of attempts to 10 from default of 1
-    boto.config.add_section("Boto")
-    boto.config.set("Boto", "metadata_service_num_attempts", "10")
-    c = boto.connect_s3(calling_format=OrdinaryCallingFormat())
-    if bucket_name is None:
-        bucket_name = DEFAULT_BUCKET
-    bucket = c.get_bucket(bucket_name.split('/')[0])
-    for p in packages:
-        if '/' in bucket_name:
-            # Allow for nested paths within the bucket name (ex:
-            # bucket/folder). Assuming forward-slashes as path
-            # delimiter.
-            name = os.path.join('/'.join(bucket_name.split('/')[1:]),
-                                os.path.basename(p))
-        else:
-            name = os.path.basename(p)
-        logging.debug("Using key: {}".format(name))
-        if bucket.get_key(name) is None or overwrite:
-            logging.info("Uploading file {}".format(name))
-            k = Key(bucket)
-            k.key = name
-            if overwrite:
-                n = k.set_contents_from_filename(p, replace=True)
-            else:
-                n = k.set_contents_from_filename(p, replace=False)
-            k.make_public()
-        else:
-            logging.warn("Not uploading file {}, as it already exists in the target bucket.".format(name))
+    # """Upload provided package output to AWS S3.
+    # """
+    # logging.debug("Uploading files to bucket '{}': {}".format(bucket_name, packages))
+    # try:
+    #     import boto
+    #     from boto.s3.key import Key
+    #     from boto.s3.connection import OrdinaryCallingFormat
+    #     logging.getLogger("boto").setLevel(logging.WARNING)
+    # except ImportError:
+    #     logging.warn("Cannot upload packages without 'boto' Python library!")
+    #     return False
+    # logging.info("Connecting to AWS S3...")
+    # # Up the number of attempts to 10 from default of 1
+    # boto.config.add_section("Boto")
+    # boto.config.set("Boto", "metadata_service_num_attempts", "10")
+    # c = boto.connect_s3(calling_format=OrdinaryCallingFormat())
+    # if bucket_name is None:
+    #     bucket_name = DEFAULT_BUCKET
+    # bucket = c.get_bucket(bucket_name.split('/')[0])
+    # for p in packages:
+    #     if '/' in bucket_name:
+    #         # Allow for nested paths within the bucket name (ex:
+    #         # bucket/folder). Assuming forward-slashes as path
+    #         # delimiter.
+    #         name = os.path.join('/'.join(bucket_name.split('/')[1:]),
+    #                             os.path.basename(p))
+    #     else:
+    #         name = os.path.basename(p)
+    #     logging.debug("Using key: {}".format(name))
+    #     if bucket.get_key(name) is None or overwrite:
+    #         logging.info("Uploading file {}".format(name))
+    #         k = Key(bucket)
+    #         k.key = name
+    #         if overwrite:
+    #             n = k.set_contents_from_filename(p, replace=True)
+    #         else:
+    #             n = k.set_contents_from_filename(p, replace=False)
+    #         k.make_public()
+    #     else:
+    #         logging.warn("Not uploading file {}, as it already exists in the target bucket.".format(name))
     return True
 
 def go_list(vendor=False, relative=False):
