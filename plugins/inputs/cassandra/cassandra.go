@@ -269,8 +269,9 @@ func (c *Cassandra) Gather(acc telegraf.Accumulator) error {
 			var m jmxMetric
 			if strings.HasPrefix(metric, "/java.lang:") {
 				m = newJavaMetric(serverTokens["host"], metric, acc)
-			} else if strings.HasPrefix(metric,
-				"/org.apache.cassandra.metrics:") {
+			} else if strings.HasPrefix(metric, 
+				"/org.apache.cassandra.metrics:") || strings.HasPrefix(metric, 
+				"/org.apache.cassandra.db:") {
 				m = newCassandraMetric(serverTokens["host"], metric, acc)
 			} else {
 				// unsupported metric type
