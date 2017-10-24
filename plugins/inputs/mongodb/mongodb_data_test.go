@@ -42,7 +42,7 @@ func TestAddNonReplStats(t *testing.T) {
 	d.flush(&acc)
 
 	for key, _ := range DefaultStats {
-		assert.True(t, acc.HasIntField("mongodb", key))
+		assert.True(t, acc.HasInt64Field("mongodb", key))
 	}
 }
 
@@ -63,16 +63,28 @@ func TestAddReplStats(t *testing.T) {
 	d.flush(&acc)
 
 	for key, _ := range MmapStats {
-		assert.True(t, acc.HasIntField("mongodb", key))
+		assert.True(t, acc.HasInt64Field("mongodb", key))
 	}
 }
 
 func TestAddWiredTigerStats(t *testing.T) {
 	d := NewMongodbData(
 		&StatLine{
-			StorageEngine:     "wiredTiger",
-			CacheDirtyPercent: 0,
-			CacheUsedPercent:  0,
+			StorageEngine:             "wiredTiger",
+			CacheDirtyPercent:         0,
+			CacheUsedPercent:          0,
+			TrackedDirtyBytes:         0,
+			CurrentCachedBytes:        0,
+			MaxBytesConfigured:        0,
+			AppThreadsPageReadCount:   0,
+			AppThreadsPageReadTime:    0,
+			AppThreadsPageWriteCount:  0,
+			BytesWrittenFrom:          0,
+			BytesReadInto:             0,
+			PagesEvictedByAppThread:   0,
+			PagesQueuedForEviction:    0,
+			ServerEvictingPages:       0,
+			WorkerThreadEvictingPages: 0,
 		},
 		tags,
 	)
@@ -95,12 +107,12 @@ func TestStateTag(t *testing.T) {
 			Insert:        0,
 			Query:         0,
 			NodeType:      "PRI",
+			NodeState:     "PRIMARY",
 		},
 		tags,
 	)
 
 	stateTags := make(map[string]string)
-	stateTags["state"] = "PRI"
 
 	var acc testutil.Accumulator
 
@@ -115,6 +127,7 @@ func TestStateTag(t *testing.T) {
 		"getmores_per_sec":      int64(0),
 		"inserts_per_sec":       int64(0),
 		"member_status":         "PRI",
+		"state":                 "PRIMARY",
 		"net_in_bytes":          int64(0),
 		"net_out_bytes":         int64(0),
 		"open_connections":      int64(0),

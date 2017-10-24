@@ -56,25 +56,40 @@ exit_if_fail make
 # Run the tests
 exit_if_fail go vet ./...
 exit_if_fail make docker-run-circle
-sleep 10
+# Sleep for OpenTSDB leadership election, aerospike cluster, etc.
+exit_if_fail sleep 60
 exit_if_fail go test -race ./...
 
 # Simple Integration Tests
-#   check that version was properly set
-exit_if_fail "telegraf -version | grep $VERSION"
 #   check that one test cpu & mem output work
 tmpdir=$(mktemp -d)
-telegraf -sample-config > $tmpdir/config.toml
-exit_if_fail telegraf -config $tmpdir/config.toml \
+./telegraf -sample-config > $tmpdir/config.toml
+exit_if_fail ./telegraf -config $tmpdir/config.toml \
     -test -input-filter cpu:mem
 
-cat $GOPATH/bin/telegraf | gzip > $CIRCLE_ARTIFACTS/telegraf.gz
+gzip telegraf -c > "$CIRCLE_ARTIFACTS/telegraf.gz"
 
-eval "git describe --exact-match HEAD"
-if [ $? -eq 0 ]; then
+if git describe --exact-match HEAD 2>&1 >/dev/null; then
+    # install fpm (packaging dependency)
+    exit_if_fail gem install fpm
+    # install boto & rpm (packaging & AWS dependencies)
+    exit_if_fail sudo apt-get install -y rpm python-boto
     unset GOGC
     tag=$(git describe --exact-match HEAD)
     echo $tag
-    exit_if_fail ./scripts/build.py --release --package --version=$tag --platform=all --arch=all --upload --bucket=dl.influxdata.com/telegraf/releases
+    exit_if_fail ./scripts/build.py --release --package --platform=all --arch=all --upload --bucket=dl.influxdata.com/telegraf/releases
+    mv build $CIRCLE_ARTIFACTS
+elif [ -n "${PACKAGE}" ]; then
+    # install fpm (packaging dependency)
+    exit_if_fail gem install fpm
+    # install boto & rpm (packaging & AWS dependencies)
+    exit_if_fail sudo apt-get install -y rpm python-boto
+    unset GOGC
+    if [ "$(git rev-parse --abbrev-ref HEAD)" = master ]
+    then
+        exit_if_fail ./scripts/build.py --nightly --package --platform=all --arch=all --upload --bucket=dl.influxdata.com/telegraf/nightlies
+    else
+        exit_if_fail ./scripts/build.py --package --platform=all --arch=all
+    fi
     mv build $CIRCLE_ARTIFACTS
 fi

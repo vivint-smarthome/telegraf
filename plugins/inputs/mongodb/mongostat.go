@@ -11,8 +11,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"gopkg.in/mgo.v2/bson"
 )
 
 const (
@@ -35,6 +33,7 @@ type MongoStatus struct {
 	ServerStatus  *ServerStatus
 	ReplSetStatus *ReplSetStatus
 	ClusterStatus *ClusterStatus
+	DbStats       *DbStats
 }
 
 type ServerStatus struct {
@@ -65,6 +64,32 @@ type ServerStatus struct {
 	Metrics            *MetricsStats          `bson:"metrics"`
 }
 
+// DbStats stores stats from all dbs
+type DbStats struct {
+	Dbs []Db
+}
+
+// Db represent a single DB
+type Db struct {
+	Name        string
+	DbStatsData *DbStatsData
+}
+
+// DbStatsData stores stats from a db
+type DbStatsData struct {
+	Db          string      `bson:"db"`
+	Collections int64       `bson:"collections"`
+	Objects     int64       `bson:"objects"`
+	AvgObjSize  float64     `bson:"avgObjSize"`
+	DataSize    int64       `bson:"dataSize"`
+	StorageSize int64       `bson:"storageSize"`
+	NumExtents  int64       `bson:"numExtents"`
+	Indexes     int64       `bson:"indexes"`
+	IndexSize   int64       `bson:"indexSize"`
+	Ok          int64       `bson:"ok"`
+	GleStats    interface{} `bson:"gleStats"`
+}
+
 // ClusterStatus stores information related to the whole cluster
 type ClusterStatus struct {
 	JumboChunksCount int64
@@ -78,9 +103,10 @@ type ReplSetStatus struct {
 
 // ReplSetMember stores information related to a replica set member
 type ReplSetMember struct {
-	Name   string               `bson:"name"`
-	State  int64                `bson:"state"`
-	Optime *bson.MongoTimestamp `bson:"optime"`
+	Name       string    `bson:"name"`
+	State      int64     `bson:"state"`
+	StateStr   string    `bson:"stateStr"`
+	OptimeDate time.Time `bson:"optimeDate"`
 }
 
 // WiredTiger stores information related to the WiredTiger storage engine.
@@ -101,9 +127,19 @@ type ConcurrentTransStats struct {
 
 // CacheStats stores cache statistics for WiredTiger.
 type CacheStats struct {
-	TrackedDirtyBytes  int64 `bson:"tracked dirty bytes in the cache"`
-	CurrentCachedBytes int64 `bson:"bytes currently in the cache"`
-	MaxBytesConfigured int64 `bson:"maximum bytes configured"`
+	TrackedDirtyBytes         int64 `bson:"tracked dirty bytes in the cache"`
+	CurrentCachedBytes        int64 `bson:"bytes currently in the cache"`
+	MaxBytesConfigured        int64 `bson:"maximum bytes configured"`
+	AppThreadsPageReadCount   int64 `bson:"application threads page read from disk to cache count"`
+	AppThreadsPageReadTime    int64 `bson:"application threads page read from disk to cache time (usecs)"`
+	AppThreadsPageWriteCount  int64 `bson:"application threads page write from cache to disk count"`
+	AppThreadsPageWriteTime   int64 `bson:"application threads page write from cache to disk time (usecs)"`
+	BytesWrittenFrom          int64 `bson:"bytes written from cache"`
+	BytesReadInto             int64 `bson:"bytes read into cache"`
+	PagesEvictedByAppThread   int64 `bson:"pages evicted by application threads"`
+	PagesQueuedForEviction    int64 `bson:"pages queued for eviction"`
+	ServerEvictingPages       int64 `bson:"eviction server evicting pages"`
+	WorkerThreadEvictingPages int64 `bson:"eviction worker thread evicting pages"`
 }
 
 // TransactionStats stores transaction checkpoints in WiredTiger.
@@ -380,6 +416,20 @@ type StatLine struct {
 	CacheDirtyPercent float64
 	CacheUsedPercent  float64
 
+	// Cache ultilization extended (wiredtiger only)
+	TrackedDirtyBytes         int64
+	CurrentCachedBytes        int64
+	MaxBytesConfigured        int64
+	AppThreadsPageReadCount   int64
+	AppThreadsPageReadTime    int64
+	AppThreadsPageWriteCount  int64
+	BytesWrittenFrom          int64
+	BytesReadInto             int64
+	PagesEvictedByAppThread   int64
+	PagesQueuedForEviction    int64
+	ServerEvictingPages       int64
+	WorkerThreadEvictingPages int64
+
 	// Replicated Opcounter fields
 	InsertR, QueryR, UpdateR, DeleteR, GetMoreR, CommandR int64
 	ReplLag                                               int64
@@ -393,9 +443,26 @@ type StatLine struct {
 	NumConnections                                        int64
 	ReplSetName                                           string
 	NodeType                                              string
+	NodeState                                             string
 
 	// Cluster fields
 	JumboChunksCount int64
+
+	// DB stats field
+	DbStatsLines []DbStatLine
+}
+
+type DbStatLine struct {
+	Name        string
+	Collections int64
+	Objects     int64
+	AvgObjSize  float64
+	DataSize    int64
+	StorageSize int64
+	NumExtents  int64
+	Indexes     int64
+	IndexSize   int64
+	Ok          int64
 }
 
 func parseLocks(stat ServerStatus) map[string]LockUsage {
@@ -471,7 +538,7 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 		returnVal.Command = diff(newStat.Opcounters.Command, oldStat.Opcounters.Command, sampleSecs)
 	}
 
-	if newStat.Metrics.TTL != nil && oldStat.Metrics.TTL != nil {
+	if newStat.Metrics != nil && newStat.Metrics.TTL != nil && oldStat.Metrics != nil && oldStat.Metrics.TTL != nil {
 		returnVal.Passes = diff(newStat.Metrics.TTL.Passes, oldStat.Metrics.TTL.Passes, sampleSecs)
 		returnVal.DeletedDocuments = diff(newStat.Metrics.TTL.DeletedDocuments, oldStat.Metrics.TTL.DeletedDocuments, sampleSecs)
 	}
@@ -491,6 +558,19 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 		returnVal.Flushes = newStat.WiredTiger.Transaction.TransCheckpoints - oldStat.WiredTiger.Transaction.TransCheckpoints
 		returnVal.CacheDirtyPercent = float64(newStat.WiredTiger.Cache.TrackedDirtyBytes) / float64(newStat.WiredTiger.Cache.MaxBytesConfigured)
 		returnVal.CacheUsedPercent = float64(newStat.WiredTiger.Cache.CurrentCachedBytes) / float64(newStat.WiredTiger.Cache.MaxBytesConfigured)
+
+		returnVal.TrackedDirtyBytes = newStat.WiredTiger.Cache.TrackedDirtyBytes
+		returnVal.CurrentCachedBytes = newStat.WiredTiger.Cache.CurrentCachedBytes
+		returnVal.MaxBytesConfigured = newStat.WiredTiger.Cache.MaxBytesConfigured
+		returnVal.AppThreadsPageReadCount = newStat.WiredTiger.Cache.AppThreadsPageReadCount
+		returnVal.AppThreadsPageReadTime = newStat.WiredTiger.Cache.AppThreadsPageReadTime
+		returnVal.AppThreadsPageWriteCount = newStat.WiredTiger.Cache.AppThreadsPageWriteCount
+		returnVal.BytesWrittenFrom = newStat.WiredTiger.Cache.BytesWrittenFrom
+		returnVal.BytesReadInto = newStat.WiredTiger.Cache.BytesReadInto
+		returnVal.PagesEvictedByAppThread = newStat.WiredTiger.Cache.PagesEvictedByAppThread
+		returnVal.PagesQueuedForEviction = newStat.WiredTiger.Cache.PagesQueuedForEviction
+		returnVal.ServerEvictingPages = newStat.WiredTiger.Cache.ServerEvictingPages
+		returnVal.WorkerThreadEvictingPages = newStat.WiredTiger.Cache.WorkerThreadEvictingPages
 	} else if newStat.BackgroundFlushing != nil && oldStat.BackgroundFlushing != nil {
 		returnVal.Flushes = newStat.BackgroundFlushing.Flushes - oldStat.BackgroundFlushing.Flushes
 	}
@@ -521,8 +601,10 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 		// BEGIN code modification
 		if newStat.Repl.IsMaster.(bool) {
 			returnVal.NodeType = "PRI"
-		} else if newStat.Repl.Secondary.(bool) {
+		} else if newStat.Repl.Secondary != nil && newStat.Repl.Secondary.(bool) {
 			returnVal.NodeType = "SEC"
+		} else if newStat.Repl.ArbiterOnly != nil && newStat.Repl.ArbiterOnly.(bool) {
+			returnVal.NodeType = "ARB"
 		} else {
 			returnVal.NodeType = "UNK"
 		}
@@ -649,6 +731,8 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 		me := ReplSetMember{}
 		for _, member := range newReplStat.Members {
 			if member.Name == myName {
+				// Store my state string
+				returnVal.NodeState = member.StateStr
 				if member.State == 1 {
 					// I'm the master
 					returnVal.ReplLag = 0
@@ -663,9 +747,9 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 			}
 		}
 
-		if me.Optime != nil && master.Optime != nil && me.State == 2 {
-			// MongoTimestamp type is int64 where the first 32bits are the unix timestamp
-			lag := int64(*master.Optime>>32 - *me.Optime>>32)
+		if me.State == 2 {
+			// OptimeDate.Unix() type is int64
+			lag := master.OptimeDate.Unix() - me.OptimeDate.Unix()
 			if lag < 0 {
 				returnVal.ReplLag = 0
 			} else {
@@ -676,6 +760,28 @@ func NewStatLine(oldMongo, newMongo MongoStatus, key string, all bool, sampleSec
 
 	newClusterStat := *newMongo.ClusterStatus
 	returnVal.JumboChunksCount = newClusterStat.JumboChunksCount
+
+	newDbStats := *newMongo.DbStats
+	for _, db := range newDbStats.Dbs {
+		dbStatsData := db.DbStatsData
+		// mongos doesn't have the db key, so setting the db name
+		if dbStatsData.Db == "" {
+			dbStatsData.Db = db.Name
+		}
+		dbStatLine := &DbStatLine{
+			Name:        dbStatsData.Db,
+			Collections: dbStatsData.Collections,
+			Objects:     dbStatsData.Objects,
+			AvgObjSize:  dbStatsData.AvgObjSize,
+			DataSize:    dbStatsData.DataSize,
+			StorageSize: dbStatsData.StorageSize,
+			NumExtents:  dbStatsData.NumExtents,
+			Indexes:     dbStatsData.Indexes,
+			IndexSize:   dbStatsData.IndexSize,
+			Ok:          dbStatsData.Ok,
+		}
+		returnVal.DbStatsLines = append(returnVal.DbStatsLines, *dbStatLine)
+	}
 
 	return returnVal
 }

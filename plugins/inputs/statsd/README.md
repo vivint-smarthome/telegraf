@@ -5,16 +5,27 @@
 ```toml
 # Statsd Server
 [[inputs.statsd]]
+  ## Protocol, must be "tcp", "udp4", "udp6" or "udp" (default=udp)
+  protocol = "udp"
+
+  ## MaxTCPConnection - applicable when protocol is set to tcp (default=250)
+  max_tcp_connections = 250
+
   ## Address and port to host UDP listener on
   service_address = ":8125"
-  ## Delete gauges every interval (default=false)
-  delete_gauges = false
-  ## Delete counters every interval (default=false)
-  delete_counters = false
-  ## Delete sets every interval (default=false)
-  delete_sets = false
-  ## Delete timings & histograms every interval (default=true)
+
+  ## The following configuration options control when telegraf clears it's cache
+  ## of previous values. If set to false, then telegraf will only clear it's
+  ## cache when the daemon is restarted.
+  ## Reset gauges every interval (default=true)
+  delete_gauges = true
+  ## Reset counters every interval (default=true)
+  delete_counters = true
+  ## Reset sets every interval (default=true)
+  delete_sets = true
+  ## Reset timings & histograms every interval (default=true)
   delete_timings = true
+
   ## Percentiles to calculate for timing & histogram stats
   percentiles = [90]
 
@@ -93,7 +104,6 @@ tags in a manner similar to the line-protocol, like this:
 users.current,service=payroll,region=us-west:32|g
 ```
 
-COMING SOON: there will be a way to specify multiple fields.
 <!-- TODO Second, you can specify multiple fields within a measurement:
 
 ```
@@ -133,6 +143,8 @@ metric type:
         for that stat during that interval.
         - `statsd_<name>_stddev`: The stddev is the sample standard deviation
         of all values statsd saw for that stat during that interval.
+        - `statsd_<name>_sum`: The sum is the sample sum of all values statsd saw
+        for that stat during that interval.
         - `statsd_<name>_count`: The count is the number of timings statsd saw
         for that stat during that interval. It is not averaged.
         - `statsd_<name>_percentile_<P>` The `Pth` percentile is a value x such
@@ -142,6 +154,9 @@ metric type:
 
 ### Plugin arguments
 
+- **protocol** string: Protocol used in listener - tcp or udp options
+- **max_tcp_connections** []int: Maximum number of concurrent TCP connections
+to allow. Used when protocol is set to tcp.
 - **service_address** string: Address to listen for statsd UDP packets on
 - **delete_gauges** boolean: Delete gauges on every collection interval
 - **delete_counters** boolean: Delete counters on every collection interval

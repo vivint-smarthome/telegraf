@@ -8,37 +8,48 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/sts"
 
 	"github.com/influxdata/telegraf"
+	internalaws "github.com/influxdata/telegraf/internal/config/aws"
 	"github.com/influxdata/telegraf/plugins/outputs"
 )
 
 type CloudWatch struct {
-	Region    string `toml:"region"`     // AWS Region
-	AccessKey string `toml:"access_key"` // Explicit AWS Access Key ID
-	SecretKey string `toml:"secret_key"` // Explicit AWS Secret Access Key
-	Namespace string `toml:"namespace"`  // CloudWatch Metrics Namespace
+	Region    string `toml:"region"`
+	AccessKey string `toml:"access_key"`
+	SecretKey string `toml:"secret_key"`
+	RoleARN   string `toml:"role_arn"`
+	Profile   string `toml:"profile"`
+	Filename  string `toml:"shared_credential_file"`
+	Token     string `toml:"token"`
+
+	Namespace string `toml:"namespace"` // CloudWatch Metrics Namespace
 	svc       *cloudwatch.CloudWatch
 }
 
 var sampleConfig = `
   ## Amazon REGION
-  region = 'us-east-1'
+  region = "us-east-1"
 
   ## Amazon Credentials
   ## Credentials are loaded in the following order
-  ## 1) explicit credentials from 'access_key' and 'secret_key'
-  ## 2) environment variables
-  ## 3) shared credentials file
-  ## 4) EC2 Instance Profile
+  ## 1) Assumed credentials via STS if role_arn is specified
+  ## 2) explicit credentials from 'access_key' and 'secret_key'
+  ## 3) shared profile from 'profile'
+  ## 4) environment variables
+  ## 5) shared credentials file
+  ## 6) EC2 Instance Profile
   #access_key = ""
   #secret_key = ""
+  #token = ""
+  #role_arn = ""
+  #profile = ""
+  #shared_credential_file = ""
 
   ## Namespace for the CloudWatch MetricDatums
-  namespace = 'InfluxData/Telegraf'
+  namespace = "InfluxData/Telegraf"
 `
 
 func (c *CloudWatch) SampleConfig() string {
@@ -50,28 +61,31 @@ func (c *CloudWatch) Description() string {
 }
 
 func (c *CloudWatch) Connect() error {
-	Config := &aws.Config{
-		Region: aws.String(c.Region),
+	credentialConfig := &internalaws.CredentialConfig{
+		Region:    c.Region,
+		AccessKey: c.AccessKey,
+		SecretKey: c.SecretKey,
+		RoleARN:   c.RoleARN,
+		Profile:   c.Profile,
+		Filename:  c.Filename,
+		Token:     c.Token,
 	}
-	if c.AccessKey != "" || c.SecretKey != "" {
-		Config.Credentials = credentials.NewStaticCredentials(c.AccessKey, c.SecretKey, "")
-	}
+	configProvider := credentialConfig.Credentials()
 
-	svc := cloudwatch.New(session.New(Config))
+	stsService := sts.New(configProvider)
 
-	params := &cloudwatch.ListMetricsInput{
-		Namespace: aws.String(c.Namespace),
-	}
+	params := &sts.GetSessionTokenInput{}
 
-	_, err := svc.ListMetrics(params) // Try a read-only call to test connection.
+	_, err := stsService.GetSessionToken(params)
 
 	if err != nil {
-		log.Printf("cloudwatch: Error in ListMetrics API call : %+v \n", err.Error())
+		log.Printf("E! cloudwatch: Cannot use credentials to connect to AWS : %+v \n", err.Error())
+		return err
 	}
 
-	c.svc = svc
+	c.svc = cloudwatch.New(configProvider)
 
-	return err
+	return nil
 }
 
 func (c *CloudWatch) Close() error {
@@ -117,7 +131,7 @@ func (c *CloudWatch) WriteToCloudWatch(datums []*cloudwatch.MetricDatum) error {
 	_, err := c.svc.PutMetricData(params)
 
 	if err != nil {
-		log.Printf("CloudWatch: Unable to write to CloudWatch : %+v \n", err.Error())
+		log.Printf("E! CloudWatch: Unable to write to CloudWatch : %+v \n", err.Error())
 	}
 
 	return err
@@ -175,6 +189,25 @@ func BuildMetricDatum(point telegraf.Metric) []*cloudwatch.MetricDatum {
 			value = float64(t.Unix())
 		default:
 			// Skip unsupported type.
+			datums = datums[:len(datums)-1]
+			continue
+		}
+
+		// Do CloudWatch boundary checking
+		// Constraints at: http://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_MetricDatum.html
+		if math.IsNaN(value) {
+			datums = datums[:len(datums)-1]
+			continue
+		}
+		if math.IsInf(value, 0) {
+			datums = datums[:len(datums)-1]
+			continue
+		}
+		if value > 0 && value < float64(8.515920e-109) {
+			datums = datums[:len(datums)-1]
+			continue
+		}
+		if value > float64(1.174271e+108) {
 			datums = datums[:len(datums)-1]
 			continue
 		}

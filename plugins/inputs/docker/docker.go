@@ -1,21 +1,23 @@
-package system
+package docker
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/net/context"
-
-	"github.com/docker/engine-api/client"
-	"github.com/docker/engine-api/types"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
@@ -24,16 +26,33 @@ import (
 type Docker struct {
 	Endpoint       string
 	ContainerNames []string
+
+	GatherServices bool `toml:"gather_services"`
+
 	Timeout        internal.Duration
+	PerDevice      bool     `toml:"perdevice"`
+	Total          bool     `toml:"total"`
+	TagEnvironment []string `toml:"tag_env"`
+	LabelInclude   []string `toml:"docker_label_include"`
+	LabelExclude   []string `toml:"docker_label_exclude"`
 
-	client DockerClient
-}
+	ContainerInclude []string `toml:"container_name_include"`
+	ContainerExclude []string `toml:"container_name_exclude"`
 
-// DockerClient interface, useful for testing
-type DockerClient interface {
-	Info(ctx context.Context) (types.Info, error)
-	ContainerList(ctx context.Context, options types.ContainerListOptions) ([]types.Container, error)
-	ContainerStats(ctx context.Context, containerID string, stream bool) (io.ReadCloser, error)
+	SSLCA              string `toml:"ssl_ca"`
+	SSLCert            string `toml:"ssl_cert"`
+	SSLKey             string `toml:"ssl_key"`
+	InsecureSkipVerify bool
+
+	newEnvClient func() (Client, error)
+	newClient    func(string, *tls.Config) (Client, error)
+
+	client          Client
+	httpClient      *http.Client
+	engine_host     string
+	filtersCreated  bool
+	labelFilter     filter.Filter
+	containerFilter filter.Filter
 }
 
 // KB, MB, GB, TB, PB...human friendly
@@ -43,6 +62,8 @@ const (
 	GB = 1000 * MB
 	TB = 1000 * GB
 	PB = 1000 * TB
+
+	defaultEndpoint = "unix:///var/run/docker.sock"
 )
 
 var (
@@ -54,49 +75,93 @@ var sampleConfig = `
   ##   To use TCP, set endpoint = "tcp://[ip]:[port]"
   ##   To use environment variables (ie, docker-machine), set endpoint = "ENV"
   endpoint = "unix:///var/run/docker.sock"
+
+  ## Set to true to collect Swarm metrics(desired_replicas, running_replicas)
+  gather_services = false
+
   ## Only collect metrics for these containers, collect all if empty
   container_names = []
+
+  ## Containers to include and exclude. Globs accepted.
+  ## Note that an empty array for both will include all containers
+  container_name_include = []
+  container_name_exclude = []
+
   ## Timeout for docker list, info, and stats commands
   timeout = "5s"
+
+  ## Whether to report for each container per-device blkio (8:0, 8:1...) and
+  ## network (eth0, eth1, ...) stats or not
+  perdevice = true
+  ## Whether to report for each container total blkio and network stats or not
+  total = false
+  ## Which environment variables should we use as a tag
+  ##tag_env = ["JAVA_HOME", "HEAP_SIZE"]
+
+  ## docker labels to include and exclude as tags.  Globs accepted.
+  ## Note that an empty array for both will include all labels as tags
+  docker_label_include = []
+  docker_label_exclude = []
+
+  ## Optional SSL Config
+  # ssl_ca = "/etc/telegraf/ca.pem"
+  # ssl_cert = "/etc/telegraf/cert.pem"
+  # ssl_key = "/etc/telegraf/key.pem"
+  ## Use SSL but skip chain & host verification
+  # insecure_skip_verify = false
 `
 
-// Description returns input description
 func (d *Docker) Description() string {
 	return "Read metrics about docker containers"
 }
 
-// SampleConfig prints sampleConfig
 func (d *Docker) SampleConfig() string { return sampleConfig }
 
-// Gather starts stats collection
 func (d *Docker) Gather(acc telegraf.Accumulator) error {
 	if d.client == nil {
-		var c *client.Client
+		var c Client
 		var err error
-		defaultHeaders := map[string]string{"User-Agent": "engine-api-cli-1.0"}
 		if d.Endpoint == "ENV" {
-			c, err = client.NewEnvClient()
-			if err != nil {
-				return err
-			}
-		} else if d.Endpoint == "" {
-			c, err = client.NewClient("unix:///var/run/docker.sock", "", nil, defaultHeaders)
-			if err != nil {
-				return err
-			}
+			c, err = d.newEnvClient()
 		} else {
-			c, err = client.NewClient(d.Endpoint, "", nil, defaultHeaders)
+			tlsConfig, err := internal.GetTLSConfig(
+				d.SSLCert, d.SSLKey, d.SSLCA, d.InsecureSkipVerify)
 			if err != nil {
 				return err
 			}
+
+			c, err = d.newClient(d.Endpoint, tlsConfig)
+		}
+		if err != nil {
+			return err
 		}
 		d.client = c
+	}
+
+	// Create label filters if not already created
+	if !d.filtersCreated {
+		err := d.createLabelFilters()
+		if err != nil {
+			return err
+		}
+		err = d.createContainerFilters()
+		if err != nil {
+			return err
+		}
+		d.filtersCreated = true
 	}
 
 	// Get daemon info
 	err := d.gatherInfo(acc)
 	if err != nil {
-		fmt.Println(err.Error())
+		acc.AddError(err)
+	}
+
+	if d.GatherServices {
+		err := d.gatherSwarmInfo(acc)
+		if err != nil {
+			acc.AddError(err)
+		}
 	}
 
 	// List containers
@@ -116,12 +181,81 @@ func (d *Docker) Gather(acc telegraf.Accumulator) error {
 			defer wg.Done()
 			err := d.gatherContainer(c, acc)
 			if err != nil {
-				log.Printf("Error gathering container %s stats: %s\n",
-					c.Names, err.Error())
+				acc.AddError(fmt.Errorf("E! Error gathering container %s stats: %s\n",
+					c.Names, err.Error()))
 			}
 		}(container)
 	}
 	wg.Wait()
+
+	return nil
+}
+
+func (d *Docker) gatherSwarmInfo(acc telegraf.Accumulator) error {
+
+	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout.Duration)
+	defer cancel()
+	services, err := d.client.ServiceList(ctx, types.ServiceListOptions{})
+	if err != nil {
+		return err
+	}
+
+	if len(services) > 0 {
+
+		tasks, err := d.client.TaskList(ctx, types.TaskListOptions{})
+		if err != nil {
+			return err
+		}
+
+		nodes, err := d.client.NodeList(ctx, types.NodeListOptions{})
+		if err != nil {
+			return err
+		}
+
+		running := map[string]int{}
+		tasksNoShutdown := map[string]int{}
+
+		activeNodes := make(map[string]struct{})
+		for _, n := range nodes {
+			if n.Status.State != swarm.NodeStateDown {
+				activeNodes[n.ID] = struct{}{}
+			}
+		}
+
+		for _, task := range tasks {
+			if task.DesiredState != swarm.TaskStateShutdown {
+				tasksNoShutdown[task.ServiceID]++
+			}
+
+			if task.Status.State == swarm.TaskStateRunning {
+				running[task.ServiceID]++
+			}
+		}
+
+		for _, service := range services {
+			tags := map[string]string{}
+			fields := make(map[string]interface{})
+			now := time.Now()
+			tags["service_id"] = service.ID
+			tags["service_name"] = service.Spec.Name
+			if service.Spec.Mode.Replicated != nil && service.Spec.Mode.Replicated.Replicas != nil {
+				tags["service_mode"] = "replicated"
+				fields["tasks_running"] = running[service.ID]
+				fields["tasks_desired"] = *service.Spec.Mode.Replicated.Replicas
+			} else if service.Spec.Mode.Global != nil {
+				tags["service_mode"] = "global"
+				fields["tasks_running"] = running[service.ID]
+				fields["tasks_desired"] = tasksNoShutdown[service.ID]
+			} else {
+				log.Printf("E! Unknow Replicas Mode")
+			}
+			// Add metrics
+			acc.AddFields("docker_swarm",
+				fields,
+				tags,
+				now)
+		}
+	}
 
 	return nil
 }
@@ -138,11 +272,15 @@ func (d *Docker) gatherInfo(acc telegraf.Accumulator) error {
 	if err != nil {
 		return err
 	}
+	d.engine_host = info.Name
 
 	fields := map[string]interface{}{
 		"n_cpus":                  info.NCPU,
 		"n_used_file_descriptors": info.NFd,
 		"n_containers":            info.Containers,
+		"n_containers_running":    info.ContainersRunning,
+		"n_containers_stopped":    info.ContainersStopped,
+		"n_containers_paused":     info.ContainersPaused,
 		"n_images":                info.Images,
 		"n_goroutines":            info.NGoroutines,
 		"n_listener_events":       info.NEventsListener,
@@ -150,11 +288,11 @@ func (d *Docker) gatherInfo(acc telegraf.Accumulator) error {
 	// Add metrics
 	acc.AddFields("docker",
 		fields,
-		nil,
+		map[string]string{"engine_host": d.engine_host},
 		now)
 	acc.AddFields("docker",
 		map[string]interface{}{"memory_total": info.MemTotal},
-		map[string]string{"unit": "bytes"},
+		map[string]string{"unit": "bytes", "engine_host": d.engine_host},
 		now)
 	// Get storage metrics
 	for _, rawData := range info.DriverStatus {
@@ -168,7 +306,7 @@ func (d *Docker) gatherInfo(acc telegraf.Accumulator) error {
 			// pool blocksize
 			acc.AddFields("docker",
 				map[string]interface{}{"pool_blocksize": value},
-				map[string]string{"unit": "bytes"},
+				map[string]string{"unit": "bytes", "engine_host": d.engine_host},
 				now)
 		} else if strings.HasPrefix(name, "data_space_") {
 			// data space
@@ -183,13 +321,13 @@ func (d *Docker) gatherInfo(acc telegraf.Accumulator) error {
 	if len(dataFields) > 0 {
 		acc.AddFields("docker_data",
 			dataFields,
-			map[string]string{"unit": "bytes"},
+			map[string]string{"unit": "bytes", "engine_host": d.engine_host},
 			now)
 	}
 	if len(metadataFields) > 0 {
 		acc.AddFields("docker_metadata",
 			metadataFields,
-			map[string]string{"unit": "bytes"},
+			map[string]string{"unit": "bytes", "engine_host": d.engine_host},
 			now)
 	}
 	return nil
@@ -207,37 +345,70 @@ func (d *Docker) gatherContainer(
 		cname = strings.TrimPrefix(container.Names[0], "/")
 	}
 
-	tags := map[string]string{
-		"container_name":  cname,
-		"container_image": container.Image,
+	// the image name sometimes has a version part, or a private repo
+	//   ie, rabbitmq:3-management or docker.someco.net:4443/rabbitmq:3-management
+	imageName := ""
+	imageVersion := "unknown"
+	i := strings.LastIndex(container.Image, ":") // index of last ':' character
+	if i > -1 {
+		imageVersion = container.Image[i+1:]
+		imageName = container.Image[:i]
+	} else {
+		imageName = container.Image
 	}
-	if len(d.ContainerNames) > 0 {
-		if !sliceContains(cname, d.ContainerNames) {
-			return nil
-		}
+
+	tags := map[string]string{
+		"engine_host":       d.engine_host,
+		"container_name":    cname,
+		"container_image":   imageName,
+		"container_version": imageVersion,
+	}
+
+	if !d.containerFilter.Match(cname) {
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout.Duration)
 	defer cancel()
 	r, err := d.client.ContainerStats(ctx, container.ID, false)
 	if err != nil {
-		log.Printf("Error getting docker stats: %s\n", err.Error())
+		return fmt.Errorf("Error getting docker stats: %s", err.Error())
 	}
-	defer r.Close()
-	dec := json.NewDecoder(r)
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
 	if err = dec.Decode(&v); err != nil {
 		if err == io.EOF {
 			return nil
 		}
 		return fmt.Errorf("Error decoding: %s", err.Error())
 	}
+	daemonOSType := r.OSType
 
 	// Add labels to tags
 	for k, label := range container.Labels {
-		tags[k] = label
+		if d.labelFilter.Match(k) {
+			tags[k] = label
+		}
 	}
 
-	gatherContainerStats(v, acc, tags, container.ID)
+	// Add whitelisted environment variables to tags
+	if len(d.TagEnvironment) > 0 {
+		info, err := d.client.ContainerInspect(ctx, container.ID)
+		if err != nil {
+			return fmt.Errorf("Error inspecting docker container: %s", err.Error())
+		}
+		for _, envvar := range info.Config.Env {
+			for _, configvar := range d.TagEnvironment {
+				dock_env := strings.SplitN(envvar, "=", 2)
+				//check for presence of tag in whitelist
+				if len(dock_env) == 2 && len(strings.TrimSpace(dock_env[1])) != 0 && configvar == dock_env[0] {
+					tags[dock_env[0]] = dock_env[1]
+				}
+			}
+		}
+	}
+
+	gatherContainerStats(v, acc, tags, container.ID, d.PerDevice, d.Total, daemonOSType)
 
 	return nil
 }
@@ -247,46 +418,70 @@ func gatherContainerStats(
 	acc telegraf.Accumulator,
 	tags map[string]string,
 	id string,
+	perDevice bool,
+	total bool,
+	daemonOSType string,
 ) {
 	now := stat.Read
 
 	memfields := map[string]interface{}{
-		"max_usage":                 stat.MemoryStats.MaxUsage,
-		"usage":                     stat.MemoryStats.Usage,
-		"fail_count":                stat.MemoryStats.Failcnt,
-		"limit":                     stat.MemoryStats.Limit,
-		"total_pgmafault":           stat.MemoryStats.Stats["total_pgmajfault"],
-		"cache":                     stat.MemoryStats.Stats["cache"],
-		"mapped_file":               stat.MemoryStats.Stats["mapped_file"],
-		"total_inactive_file":       stat.MemoryStats.Stats["total_inactive_file"],
-		"pgpgout":                   stat.MemoryStats.Stats["pagpgout"],
-		"rss":                       stat.MemoryStats.Stats["rss"],
-		"total_mapped_file":         stat.MemoryStats.Stats["total_mapped_file"],
-		"writeback":                 stat.MemoryStats.Stats["writeback"],
-		"unevictable":               stat.MemoryStats.Stats["unevictable"],
-		"pgpgin":                    stat.MemoryStats.Stats["pgpgin"],
-		"total_unevictable":         stat.MemoryStats.Stats["total_unevictable"],
-		"pgmajfault":                stat.MemoryStats.Stats["pgmajfault"],
-		"total_rss":                 stat.MemoryStats.Stats["total_rss"],
-		"total_rss_huge":            stat.MemoryStats.Stats["total_rss_huge"],
-		"total_writeback":           stat.MemoryStats.Stats["total_write_back"],
-		"total_inactive_anon":       stat.MemoryStats.Stats["total_inactive_anon"],
-		"rss_huge":                  stat.MemoryStats.Stats["rss_huge"],
-		"hierarchical_memory_limit": stat.MemoryStats.Stats["hierarchical_memory_limit"],
-		"total_pgfault":             stat.MemoryStats.Stats["total_pgfault"],
-		"total_active_file":         stat.MemoryStats.Stats["total_active_file"],
-		"active_anon":               stat.MemoryStats.Stats["active_anon"],
-		"total_active_anon":         stat.MemoryStats.Stats["total_active_anon"],
-		"total_pgpgout":             stat.MemoryStats.Stats["total_pgpgout"],
-		"total_cache":               stat.MemoryStats.Stats["total_cache"],
-		"inactive_anon":             stat.MemoryStats.Stats["inactive_anon"],
-		"active_file":               stat.MemoryStats.Stats["active_file"],
-		"pgfault":                   stat.MemoryStats.Stats["pgfault"],
-		"inactive_file":             stat.MemoryStats.Stats["inactive_file"],
-		"total_pgpgin":              stat.MemoryStats.Stats["total_pgpgin"],
-		"usage_percent":             calculateMemPercent(stat),
-		"container_id":              id,
+		"container_id": id,
 	}
+
+	memstats := []string{
+		"active_anon",
+		"active_file",
+		"cache",
+		"hierarchical_memory_limit",
+		"inactive_anon",
+		"inactive_file",
+		"mapped_file",
+		"pgfault",
+		"pgmajfault",
+		"pgpgin",
+		"pgpgout",
+		"rss",
+		"rss_huge",
+		"total_active_anon",
+		"total_active_file",
+		"total_cache",
+		"total_inactive_anon",
+		"total_inactive_file",
+		"total_mapped_file",
+		"total_pgfault",
+		"total_pgmajfault",
+		"total_pgpgin",
+		"total_pgpgout",
+		"total_rss",
+		"total_rss_huge",
+		"total_unevictable",
+		"total_writeback",
+		"unevictable",
+		"writeback",
+	}
+	for _, field := range memstats {
+		if value, ok := stat.MemoryStats.Stats[field]; ok {
+			memfields[field] = value
+		}
+	}
+	if stat.MemoryStats.Failcnt != 0 {
+		memfields["fail_count"] = stat.MemoryStats.Failcnt
+	}
+
+	if daemonOSType != "windows" {
+		memfields["limit"] = stat.MemoryStats.Limit
+		memfields["usage"] = stat.MemoryStats.Usage
+		memfields["max_usage"] = stat.MemoryStats.MaxUsage
+
+		mem := calculateMemUsageUnixNoCache(stat.MemoryStats)
+		memLimit := float64(stat.MemoryStats.Limit)
+		memfields["usage_percent"] = calculateMemPercentUnixNoCache(memLimit, mem)
+	} else {
+		memfields["commit_bytes"] = stat.MemoryStats.Commit
+		memfields["commit_peak_bytes"] = stat.MemoryStats.CommitPeak
+		memfields["private_working_set"] = stat.MemoryStats.PrivateWorkingSet
+	}
+
 	acc.AddFields("docker_container_mem", memfields, tags, now)
 
 	cpufields := map[string]interface{}{
@@ -297,14 +492,33 @@ func gatherContainerStats(
 		"throttling_periods":           stat.CPUStats.ThrottlingData.Periods,
 		"throttling_throttled_periods": stat.CPUStats.ThrottlingData.ThrottledPeriods,
 		"throttling_throttled_time":    stat.CPUStats.ThrottlingData.ThrottledTime,
-		"usage_percent":                calculateCPUPercent(stat),
 		"container_id":                 id,
 	}
+
+	if daemonOSType != "windows" {
+		previousCPU := stat.PreCPUStats.CPUUsage.TotalUsage
+		previousSystem := stat.PreCPUStats.SystemUsage
+		cpuPercent := calculateCPUPercentUnix(previousCPU, previousSystem, stat)
+		cpufields["usage_percent"] = cpuPercent
+	} else {
+		cpuPercent := calculateCPUPercentWindows(stat)
+		cpufields["usage_percent"] = cpuPercent
+	}
+
 	cputags := copyTags(tags)
 	cputags["cpu"] = "cpu-total"
 	acc.AddFields("docker_container_cpu", cpufields, cputags, now)
 
-	for i, percpu := range stat.CPUStats.CPUUsage.PercpuUsage {
+	// If we have OnlineCPUs field, then use it to restrict stats gathering to only Online CPUs
+	// (https://github.com/moby/moby/commit/115f91d7575d6de6c7781a96a082f144fd17e400)
+	var percpuusage []uint64
+	if stat.CPUStats.OnlineCPUs > 0 {
+		percpuusage = stat.CPUStats.CPUUsage.PercpuUsage[:stat.CPUStats.OnlineCPUs]
+	} else {
+		percpuusage = stat.CPUStats.CPUUsage.PercpuUsage
+	}
+
+	for i, percpu := range percpuusage {
 		percputags := copyTags(tags)
 		percputags["cpu"] = fmt.Sprintf("cpu%d", i)
 		fields := map[string]interface{}{
@@ -314,6 +528,7 @@ func gatherContainerStats(
 		acc.AddFields("docker_container_cpu", fields, percputags, now)
 	}
 
+	totalNetworkStatMap := make(map[string]interface{})
 	for network, netstats := range stat.Networks {
 		netfields := map[string]interface{}{
 			"rx_dropped":   netstats.RxDropped,
@@ -327,32 +542,46 @@ func gatherContainerStats(
 			"container_id": id,
 		}
 		// Create a new network tag dictionary for the "network" tag
+		if perDevice {
+			nettags := copyTags(tags)
+			nettags["network"] = network
+			acc.AddFields("docker_container_net", netfields, nettags, now)
+		}
+		if total {
+			for field, value := range netfields {
+				if field == "container_id" {
+					continue
+				}
+
+				var uintV uint64
+				switch v := value.(type) {
+				case uint64:
+					uintV = v
+				case int64:
+					uintV = uint64(v)
+				default:
+					continue
+				}
+
+				_, ok := totalNetworkStatMap[field]
+				if ok {
+					totalNetworkStatMap[field] = totalNetworkStatMap[field].(uint64) + uintV
+				} else {
+					totalNetworkStatMap[field] = uintV
+				}
+			}
+		}
+	}
+
+	// totalNetworkStatMap could be empty if container is running with --net=host.
+	if total && len(totalNetworkStatMap) != 0 {
 		nettags := copyTags(tags)
-		nettags["network"] = network
-		acc.AddFields("docker_container_net", netfields, nettags, now)
+		nettags["network"] = "total"
+		totalNetworkStatMap["container_id"] = id
+		acc.AddFields("docker_container_net", totalNetworkStatMap, nettags, now)
 	}
 
-	gatherBlockIOMetrics(stat, acc, tags, now, id)
-}
-
-func calculateMemPercent(stat *types.StatsJSON) float64 {
-	var memPercent = 0.0
-	if stat.MemoryStats.Limit > 0 {
-		memPercent = float64(stat.MemoryStats.Usage) / float64(stat.MemoryStats.Limit) * 100.0
-	}
-	return memPercent
-}
-
-func calculateCPUPercent(stat *types.StatsJSON) float64 {
-	var cpuPercent = 0.0
-	// calculate the change for the cpu and system usage of the container in between readings
-	cpuDelta := float64(stat.CPUStats.CPUUsage.TotalUsage) - float64(stat.PreCPUStats.CPUUsage.TotalUsage)
-	systemDelta := float64(stat.CPUStats.SystemUsage) - float64(stat.PreCPUStats.SystemUsage)
-
-	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		cpuPercent = (cpuDelta / systemDelta) * float64(len(stat.CPUStats.CPUUsage.PercpuUsage)) * 100.0
-	}
-	return cpuPercent
+	gatherBlockIOMetrics(stat, acc, tags, now, id, perDevice, total)
 }
 
 func gatherBlockIOMetrics(
@@ -361,6 +590,8 @@ func gatherBlockIOMetrics(
 	tags map[string]string,
 	now time.Time,
 	id string,
+	perDevice bool,
+	total bool,
 ) {
 	blkioStats := stat.BlkioStats
 	// Make a map of devices to their block io stats
@@ -422,11 +653,44 @@ func gatherBlockIOMetrics(
 		deviceStatMap[device]["sectors_recursive"] = metric.Value
 	}
 
+	totalStatMap := make(map[string]interface{})
 	for device, fields := range deviceStatMap {
-		iotags := copyTags(tags)
-		iotags["device"] = device
 		fields["container_id"] = id
-		acc.AddFields("docker_container_blkio", fields, iotags, now)
+		if perDevice {
+			iotags := copyTags(tags)
+			iotags["device"] = device
+			acc.AddFields("docker_container_blkio", fields, iotags, now)
+		}
+		if total {
+			for field, value := range fields {
+				if field == "container_id" {
+					continue
+				}
+
+				var uintV uint64
+				switch v := value.(type) {
+				case uint64:
+					uintV = v
+				case int64:
+					uintV = uint64(v)
+				default:
+					continue
+				}
+
+				_, ok := totalStatMap[field]
+				if ok {
+					totalStatMap[field] = totalStatMap[field].(uint64) + uintV
+				} else {
+					totalStatMap[field] = uintV
+				}
+			}
+		}
+	}
+	if total {
+		totalStatMap["container_id"] = id
+		iotags := copyTags(tags)
+		iotags["device"] = "total"
+		acc.AddFields("docker_container_blkio", totalStatMap, iotags, now)
 	}
 }
 
@@ -468,10 +732,38 @@ func parseSize(sizeStr string) (int64, error) {
 	return int64(size), nil
 }
 
+func (d *Docker) createContainerFilters() error {
+	// Backwards compatibility for deprecated `container_names` parameter.
+	if len(d.ContainerNames) > 0 {
+		d.ContainerInclude = append(d.ContainerInclude, d.ContainerNames...)
+	}
+
+	filter, err := filter.NewIncludeExcludeFilter(d.ContainerInclude, d.ContainerExclude)
+	if err != nil {
+		return err
+	}
+	d.containerFilter = filter
+	return nil
+}
+
+func (d *Docker) createLabelFilters() error {
+	filter, err := filter.NewIncludeExcludeFilter(d.LabelInclude, d.LabelExclude)
+	if err != nil {
+		return err
+	}
+	d.labelFilter = filter
+	return nil
+}
+
 func init() {
 	inputs.Add("docker", func() telegraf.Input {
 		return &Docker{
-			Timeout: internal.Duration{Duration: time.Second * 5},
+			PerDevice:      true,
+			Timeout:        internal.Duration{Duration: time.Second * 5},
+			Endpoint:       defaultEndpoint,
+			newEnvClient:   NewEnvClient,
+			newClient:      NewClient,
+			filtersCreated: false,
 		}
 	})
 }

@@ -135,10 +135,12 @@ case $1 in
         fi
 
         log_success_msg "Starting the process" "$name"
-        if which start-stop-daemon > /dev/null 2>&1; then
+        if command -v startproc >/dev/null; then
+            startproc -u "$USER" -g "$GROUP" -p "$pidfile" -q -- "$daemon" -pidfile "$pidfile" -config "$config" -config-directory "$confdir" $TELEGRAF_OPTS
+        elif which start-stop-daemon > /dev/null 2>&1; then
             start-stop-daemon --chuid $USER:$GROUP --start --quiet --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config -config-directory $confdir $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &
         else
-            nohup sudo -u $USER $daemon -pidfile $pidfile -config $config -config-directory $confdir $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &
+            su -s /bin/sh -c "nohup $daemon -pidfile $pidfile -config $config -config-directory $confdir $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &" $USER
         fi
         log_success_msg "$name process was started"
         ;;

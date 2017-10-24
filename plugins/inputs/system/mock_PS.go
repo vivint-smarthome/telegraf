@@ -1,6 +1,8 @@
 package system
 
 import (
+	"os"
+
 	"github.com/stretchr/testify/mock"
 
 	"github.com/shirou/gopsutil/cpu"
@@ -13,57 +15,68 @@ import (
 
 type MockPS struct {
 	mock.Mock
+	PSDiskDeps
 }
 
-func (m *MockPS) LoadAvg() (*load.LoadAvgStat, error) {
+type MockPSDisk struct {
+	*systemPS
+	*mock.Mock
+}
+
+type mockDiskUsage struct {
+	*mock.Mock
+}
+
+func (m *MockPS) LoadAvg() (*load.AvgStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).(*load.LoadAvgStat)
+	r0 := ret.Get(0).(*load.AvgStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
 }
 
-func (m *MockPS) CPUTimes(perCPU, totalCPU bool) ([]cpu.CPUTimesStat, error) {
+func (m *MockPS) CPUTimes(perCPU, totalCPU bool) ([]cpu.TimesStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).([]cpu.CPUTimesStat)
+	r0 := ret.Get(0).([]cpu.TimesStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
 }
 
-func (m *MockPS) DiskUsage(mountPointFilter []string, fstypeExclude []string) ([]*disk.DiskUsageStat, error) {
+func (m *MockPS) DiskUsage(mountPointFilter []string, fstypeExclude []string) ([]*disk.UsageStat, []*disk.PartitionStat, error) {
 	ret := m.Called(mountPointFilter, fstypeExclude)
 
-	r0 := ret.Get(0).([]*disk.DiskUsageStat)
+	r0 := ret.Get(0).([]*disk.UsageStat)
+	r1 := ret.Get(1).([]*disk.PartitionStat)
+	r2 := ret.Error(2)
+
+	return r0, r1, r2
+}
+
+func (m *MockPS) NetIO() ([]net.IOCountersStat, error) {
+	ret := m.Called()
+
+	r0 := ret.Get(0).([]net.IOCountersStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
 }
 
-func (m *MockPS) NetIO() ([]net.NetIOCountersStat, error) {
+func (m *MockPS) NetProto() ([]net.ProtoCountersStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).([]net.NetIOCountersStat)
+	r0 := ret.Get(0).([]net.ProtoCountersStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
 }
 
-func (m *MockPS) NetProto() ([]net.NetProtoCountersStat, error) {
+func (m *MockPS) DiskIO(names []string) (map[string]disk.IOCountersStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).([]net.NetProtoCountersStat)
-	r1 := ret.Error(1)
-
-	return r0, r1
-}
-
-func (m *MockPS) DiskIO() (map[string]disk.DiskIOCountersStat, error) {
-	ret := m.Called()
-
-	r0 := ret.Get(0).(map[string]disk.DiskIOCountersStat)
+	r0 := ret.Get(0).(map[string]disk.IOCountersStat)
 	r1 := ret.Error(1)
 
 	return r0, r1
@@ -87,10 +100,42 @@ func (m *MockPS) SwapStat() (*mem.SwapMemoryStat, error) {
 	return r0, r1
 }
 
-func (m *MockPS) NetConnections() ([]net.NetConnectionStat, error) {
+func (m *MockPS) NetConnections() ([]net.ConnectionStat, error) {
 	ret := m.Called()
 
-	r0 := ret.Get(0).([]net.NetConnectionStat)
+	r0 := ret.Get(0).([]net.ConnectionStat)
+	r1 := ret.Error(1)
+
+	return r0, r1
+}
+
+func (m *mockDiskUsage) Partitions(all bool) ([]disk.PartitionStat, error) {
+	ret := m.Called(all)
+
+	r0 := ret.Get(0).([]disk.PartitionStat)
+	r1 := ret.Error(1)
+
+	return r0, r1
+}
+
+func (m *mockDiskUsage) OSGetenv(key string) string {
+	ret := m.Called(key)
+	return ret.Get(0).(string)
+}
+
+func (m *mockDiskUsage) OSStat(name string) (os.FileInfo, error) {
+	ret := m.Called(name)
+
+	r0 := ret.Get(0).(os.FileInfo)
+	r1 := ret.Error(1)
+
+	return r0, r1
+}
+
+func (m *mockDiskUsage) PSDiskUsage(path string) (*disk.UsageStat, error) {
+	ret := m.Called(path)
+
+	r0 := ret.Get(0).(*disk.UsageStat)
 	r1 := ret.Error(1)
 
 	return r0, r1

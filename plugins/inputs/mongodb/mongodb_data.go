@@ -12,16 +12,20 @@ type MongodbData struct {
 	StatLine *StatLine
 	Fields   map[string]interface{}
 	Tags     map[string]string
+	DbData   []DbData
+}
+
+type DbData struct {
+	Name   string
+	Fields map[string]interface{}
 }
 
 func NewMongodbData(statLine *StatLine, tags map[string]string) *MongodbData {
-	if statLine.NodeType != "" && statLine.NodeType != "UNK" {
-		tags["state"] = statLine.NodeType
-	}
 	return &MongodbData{
 		StatLine: statLine,
 		Tags:     tags,
 		Fields:   make(map[string]interface{}),
+		DbData:   []DbData{},
 	}
 }
 
@@ -54,6 +58,7 @@ var DefaultReplStats = map[string]string{
 	"repl_getmores_per_sec": "GetMoreR",
 	"repl_commands_per_sec": "CommandR",
 	"member_status":         "NodeType",
+	"state":                 "NodeState",
 	"repl_lag":              "ReplLag",
 }
 
@@ -72,6 +77,49 @@ var WiredTigerStats = map[string]string{
 	"percent_cache_used":  "CacheUsedPercent",
 }
 
+var WiredTigerExtStats = map[string]string{
+	"wtcache_tracked_dirty_bytes":          "TrackedDirtyBytes",
+	"wtcache_current_bytes":                "CurrentCachedBytes",
+	"wtcache_max_bytes_configured":         "MaxBytesConfigured",
+	"wtcache_app_threads_page_read_count":  "AppThreadsPageReadCount",
+	"wtcache_app_threads_page_read_time":   "AppThreadsPageReadTime",
+	"wtcache_app_threads_page_write_count": "AppThreadsPageWriteCount",
+	"wtcache_bytes_written_from":           "BytesWrittenFrom",
+	"wtcache_bytes_read_into":              "BytesReadInto",
+	"wtcache_pages_evicted_by_app_thread":  "PagesEvictedByAppThread",
+	"wtcache_pages_queued_for_eviction":    "PagesQueuedForEviction",
+	"wtcache_server_evicting_pages":        "ServerEvictingPages",
+	"wtcache_worker_thread_evictingpages":  "WorkerThreadEvictingPages",
+}
+
+var DbDataStats = map[string]string{
+	"collections":  "Collections",
+	"objects":      "Objects",
+	"avg_obj_size": "AvgObjSize",
+	"data_size":    "DataSize",
+	"storage_size": "StorageSize",
+	"num_extents":  "NumExtents",
+	"indexes":      "Indexes",
+	"index_size":   "IndexSize",
+	"ok":           "Ok",
+}
+
+func (d *MongodbData) AddDbStats() {
+	for _, dbstat := range d.StatLine.DbStatsLines {
+		dbStatLine := reflect.ValueOf(&dbstat).Elem()
+		newDbData := &DbData{
+			Name:   dbstat.Name,
+			Fields: make(map[string]interface{}),
+		}
+		newDbData.Fields["type"] = "db_stat"
+		for key, value := range DbDataStats {
+			val := dbStatLine.FieldByName(value).Interface()
+			newDbData.Fields[key] = val
+		}
+		d.DbData = append(d.DbData, *newDbData)
+	}
+}
+
 func (d *MongodbData) AddDefaultStats() {
 	statLine := reflect.ValueOf(d.StatLine).Elem()
 	d.addStat(statLine, DefaultStats)
@@ -88,13 +136,11 @@ func (d *MongodbData) AddDefaultStats() {
 			floatVal, _ := strconv.ParseFloat(percentVal, 64)
 			d.add(key, floatVal)
 		}
+		d.addStat(statLine, WiredTigerExtStats)
 	}
 }
 
-func (d *MongodbData) addStat(
-	statLine reflect.Value,
-	stats map[string]string,
-) {
+func (d *MongodbData) addStat(statLine reflect.Value, stats map[string]string) {
 	for key, value := range stats {
 		val := statLine.FieldByName(value).Interface()
 		d.add(key, val)
@@ -113,4 +159,15 @@ func (d *MongodbData) flush(acc telegraf.Accumulator) {
 		d.StatLine.Time,
 	)
 	d.Fields = make(map[string]interface{})
+
+	for _, db := range d.DbData {
+		d.Tags["db_name"] = db.Name
+		acc.AddFields(
+			"mongodb_db_stats",
+			db.Fields,
+			d.Tags,
+			d.StatLine.Time,
+		)
+		db.Fields = make(map[string]interface{})
+	}
 }

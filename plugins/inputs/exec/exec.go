@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/gonuts/go-shellquote"
+	"github.com/kballard/go-shellquote"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -19,7 +22,11 @@ import (
 
 const sampleConfig = `
   ## Commands array
-  commands = ["/tmp/test.sh", "/usr/bin/mycollector --foo=bar"]
+  commands = [
+    "/tmp/test.sh",
+    "/usr/bin/mycollector --foo=bar",
+    "/tmp/collect_*.sh"
+  ]
 
   ## Timeout for each command to complete.
   timeout = "5s"
@@ -28,7 +35,7 @@ const sampleConfig = `
   name_suffix = "_mycollector"
 
   ## Data format to consume.
-  ## Each data format has it's own unique set of configuration options, read
+  ## Each data format has its own unique set of configuration options, read
   ## more about them here:
   ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
   data_format = "influx"
@@ -41,10 +48,7 @@ type Exec struct {
 
 	parser parsers.Parser
 
-	wg sync.WaitGroup
-
-	runner  Runner
-	errChan chan error
+	runner Runner
 }
 
 func NewExec() *Exec {
@@ -109,21 +113,48 @@ func (c CommandRunner) Run(
 		}
 	}
 
+	out = removeCarriageReturns(out)
 	return out.Bytes(), nil
 }
 
-func (e *Exec) ProcessCommand(command string, acc telegraf.Accumulator) {
-	defer e.wg.Done()
+// removeCarriageReturns removes all carriage returns from the input if the
+// OS is Windows. It does not return any errors.
+func removeCarriageReturns(b bytes.Buffer) bytes.Buffer {
+	if runtime.GOOS == "windows" {
+		var buf bytes.Buffer
+		for {
+			byt, er := b.ReadBytes(0x0D)
+			end := len(byt)
+			if nil == er {
+				end -= 1
+			}
+			if nil != byt {
+				buf.Write(byt[:end])
+			} else {
+				break
+			}
+			if nil != er {
+				break
+			}
+		}
+		b = buf
+	}
+	return b
+
+}
+
+func (e *Exec) ProcessCommand(command string, acc telegraf.Accumulator, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	out, err := e.runner.Run(e, command, acc)
 	if err != nil {
-		e.errChan <- err
+		acc.AddError(err)
 		return
 	}
 
 	metrics, err := e.parser.Parse(out)
 	if err != nil {
-		e.errChan <- err
+		acc.AddError(err)
 	} else {
 		for _, metric := range metrics {
 			acc.AddFields(metric.Name(), metric.Fields(), metric.Tags(), metric.Time())
@@ -144,29 +175,50 @@ func (e *Exec) SetParser(parser parsers.Parser) {
 }
 
 func (e *Exec) Gather(acc telegraf.Accumulator) error {
+	var wg sync.WaitGroup
 	// Legacy single command support
 	if e.Command != "" {
 		e.Commands = append(e.Commands, e.Command)
 		e.Command = ""
 	}
 
-	e.errChan = make(chan error, len(e.Commands))
+	commands := make([]string, 0, len(e.Commands))
+	for _, pattern := range e.Commands {
+		cmdAndArgs := strings.SplitN(pattern, " ", 2)
+		if len(cmdAndArgs) == 0 {
+			continue
+		}
 
-	e.wg.Add(len(e.Commands))
-	for _, command := range e.Commands {
-		go e.ProcessCommand(command, acc)
+		matches, err := filepath.Glob(cmdAndArgs[0])
+		if err != nil {
+			acc.AddError(err)
+			continue
+		}
+
+		if len(matches) == 0 {
+			// There were no matches with the glob pattern, so let's assume
+			// that the command is in PATH and just run it as it is
+			commands = append(commands, pattern)
+		} else {
+			// There were matches, so we'll append each match together with
+			// the arguments to the commands slice
+			for _, match := range matches {
+				if len(cmdAndArgs) == 1 {
+					commands = append(commands, match)
+				} else {
+					commands = append(commands,
+						strings.Join([]string{match, cmdAndArgs[1]}, " "))
+				}
+			}
+		}
 	}
-	e.wg.Wait()
 
-	select {
-	default:
-		close(e.errChan)
-		return nil
-	case err := <-e.errChan:
-		close(e.errChan)
-		return err
+	wg.Add(len(commands))
+	for _, command := range commands {
+		go e.ProcessCommand(command, acc, &wg)
 	}
-
+	wg.Wait()
+	return nil
 }
 
 func init() {

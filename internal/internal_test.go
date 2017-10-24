@@ -40,6 +40,7 @@ func TestSnakeCase(t *testing.T) {
 var (
 	sleepbin, _ = exec.LookPath("sleep")
 	echobin, _  = exec.LookPath("echo")
+	shell, _    = exec.LookPath("sh")
 )
 
 func TestRunTimeout(t *testing.T) {
@@ -84,13 +85,13 @@ func TestCombinedOutput(t *testing.T) {
 // test that CombinedOutputTimeout and exec.Cmd.CombinedOutput return
 // the same output from a failed command.
 func TestCombinedOutputError(t *testing.T) {
-	if sleepbin == "" {
-		t.Skip("'sleep' binary not available on OS, skipping.")
+	if shell == "" {
+		t.Skip("'sh' binary not available on OS, skipping.")
 	}
-	cmd := exec.Command(sleepbin, "foo")
+	cmd := exec.Command(shell, "-c", "false")
 	expected, err := cmd.CombinedOutput()
 
-	cmd2 := exec.Command(sleepbin, "foo")
+	cmd2 := exec.Command(shell, "-c", "false")
 	actual, err := CombinedOutputTimeout(cmd2, time.Second)
 
 	assert.Error(t, err)
@@ -98,11 +99,59 @@ func TestCombinedOutputError(t *testing.T) {
 }
 
 func TestRunError(t *testing.T) {
-	if sleepbin == "" {
-		t.Skip("'sleep' binary not available on OS, skipping.")
+	if shell == "" {
+		t.Skip("'sh' binary not available on OS, skipping.")
 	}
-	cmd := exec.Command(sleepbin, "foo")
+	cmd := exec.Command(shell, "-c", "false")
 	err := RunTimeout(cmd, time.Second)
 
 	assert.Error(t, err)
+}
+
+func TestRandomSleep(t *testing.T) {
+	// test that zero max returns immediately
+	s := time.Now()
+	RandomSleep(time.Duration(0), make(chan struct{}))
+	elapsed := time.Since(s)
+	assert.True(t, elapsed < time.Millisecond)
+
+	// test that max sleep is respected
+	s = time.Now()
+	RandomSleep(time.Millisecond*50, make(chan struct{}))
+	elapsed = time.Since(s)
+	assert.True(t, elapsed < time.Millisecond*100)
+
+	// test that shutdown is respected
+	s = time.Now()
+	shutdown := make(chan struct{})
+	go func() {
+		time.Sleep(time.Millisecond * 100)
+		close(shutdown)
+	}()
+	RandomSleep(time.Second, shutdown)
+	elapsed = time.Since(s)
+	assert.True(t, elapsed < time.Millisecond*150)
+}
+
+func TestDuration(t *testing.T) {
+	var d Duration
+
+	d.UnmarshalTOML([]byte(`"1s"`))
+	assert.Equal(t, time.Second, d.Duration)
+
+	d = Duration{}
+	d.UnmarshalTOML([]byte(`1s`))
+	assert.Equal(t, time.Second, d.Duration)
+
+	d = Duration{}
+	d.UnmarshalTOML([]byte(`'1s'`))
+	assert.Equal(t, time.Second, d.Duration)
+
+	d = Duration{}
+	d.UnmarshalTOML([]byte(`10`))
+	assert.Equal(t, 10*time.Second, d.Duration)
+
+	d = Duration{}
+	d.UnmarshalTOML([]byte(`1.5`))
+	assert.Equal(t, time.Second, d.Duration)
 }

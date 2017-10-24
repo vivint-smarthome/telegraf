@@ -12,16 +12,46 @@ import (
 	"time"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
 type Apache struct {
-	Urls []string
+	Urls            []string
+	Username        string
+	Password        string
+	ResponseTimeout internal.Duration
+	// Path to CA file
+	SSLCA string `toml:"ssl_ca"`
+	// Path to host cert file
+	SSLCert string `toml:"ssl_cert"`
+	// Path to cert key file
+	SSLKey string `toml:"ssl_key"`
+	// Use SSL but skip chain & host verification
+	InsecureSkipVerify bool
+
+	client *http.Client
 }
 
 var sampleConfig = `
-  ## An array of Apache status URI to gather stats.
+  ## An array of URLs to gather from, must be directed at the machine
+  ## readable version of the mod_status page including the auto query string.
+  ## Default is "http://localhost/server-status?auto".
   urls = ["http://localhost/server-status?auto"]
+
+  ## Credentials for basic HTTP authentication.
+  # username = "myuser"
+  # password = "mypassword"
+
+  ## Maximum time to receive response.
+  # response_timeout = "5s"
+
+  ## Optional SSL Config
+  # ssl_ca = "/etc/telegraf/ca.pem"
+  # ssl_cert = "/etc/telegraf/cert.pem"
+  # ssl_key = "/etc/telegraf/key.pem"
+  ## Use SSL but skip chain & host verification
+  # insecure_skip_verify = false
 `
 
 func (n *Apache) SampleConfig() string {
@@ -33,42 +63,73 @@ func (n *Apache) Description() string {
 }
 
 func (n *Apache) Gather(acc telegraf.Accumulator) error {
-	var wg sync.WaitGroup
-	var outerr error
+	if len(n.Urls) == 0 {
+		n.Urls = []string{"http://localhost/server-status?auto"}
+	}
+	if n.ResponseTimeout.Duration < time.Second {
+		n.ResponseTimeout.Duration = time.Second * 5
+	}
 
+	if n.client == nil {
+		client, err := n.createHttpClient()
+		if err != nil {
+			return err
+		}
+		n.client = client
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(len(n.Urls))
 	for _, u := range n.Urls {
 		addr, err := url.Parse(u)
 		if err != nil {
-			return fmt.Errorf("Unable to parse address '%s': %s", u, err)
+			acc.AddError(fmt.Errorf("Unable to parse address '%s': %s", u, err))
+			continue
 		}
 
-		wg.Add(1)
 		go func(addr *url.URL) {
 			defer wg.Done()
-			outerr = n.gatherUrl(addr, acc)
+			acc.AddError(n.gatherUrl(addr, acc))
 		}(addr)
 	}
 
 	wg.Wait()
-
-	return outerr
+	return nil
 }
 
-var tr = &http.Transport{
-	ResponseHeaderTimeout: time.Duration(3 * time.Second),
-}
+func (n *Apache) createHttpClient() (*http.Client, error) {
+	tlsCfg, err := internal.GetTLSConfig(
+		n.SSLCert, n.SSLKey, n.SSLCA, n.InsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
 
-var client = &http.Client{
-	Transport: tr,
-	Timeout:   time.Duration(4 * time.Second),
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsCfg,
+		},
+		Timeout: n.ResponseTimeout.Duration,
+	}
+
+	return client, nil
 }
 
 func (n *Apache) gatherUrl(addr *url.URL, acc telegraf.Accumulator) error {
-	resp, err := client.Get(addr.String())
+	req, err := http.NewRequest("GET", addr.String(), nil)
 	if err != nil {
-		return fmt.Errorf("error making HTTP request to %s: %s", addr.String(), err)
+		return fmt.Errorf("error on new request to %s : %s\n", addr.String(), err)
+	}
+
+	if len(n.Username) != 0 && len(n.Password) != 0 {
+		req.SetBasicAuth(n.Username, n.Password)
+	}
+
+	resp, err := n.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("error on request to %s : %s\n", addr.String(), err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("%s returned HTTP status %s", addr.String(), resp.Status)
 	}

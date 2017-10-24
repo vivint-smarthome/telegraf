@@ -55,7 +55,11 @@ func (d *Datadog) Connect() error {
 	if d.Apikey == "" {
 		return fmt.Errorf("apikey is a required field for datadog output")
 	}
+
 	d.client = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+		},
 		Timeout: d.Timeout.Duration,
 	}
 	return nil
@@ -92,7 +96,7 @@ func (d *Datadog) Write(metrics []telegraf.Metric) error {
 				metricCounter++
 			}
 		} else {
-			log.Printf("unable to build Metric for %s, skipping\n", m.Name())
+			log.Printf("I! unable to build Metric for %s, skipping\n", m.Name())
 		}
 	}
 

@@ -2,10 +2,11 @@ package sqlserver
 
 import (
 	"database/sql"
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/plugins/inputs"
 	"sync"
 	"time"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/plugins/inputs"
 
 	// go-mssqldb initialization
 	_ "github.com/zensqlmonitor/go-mssqldb"
@@ -79,20 +80,19 @@ func (s *SQLServer) Gather(acc telegraf.Accumulator) error {
 	}
 
 	var wg sync.WaitGroup
-	var outerr error
 
 	for _, serv := range s.Servers {
 		for _, query := range queries {
 			wg.Add(1)
 			go func(serv string, query Query) {
 				defer wg.Done()
-				outerr = s.gatherServer(serv, query, acc)
+				acc.AddError(s.gatherServer(serv, query, acc))
 			}(serv, query)
 		}
 	}
 
 	wg.Wait()
-	return outerr
+	return nil
 }
 
 func (s *SQLServer) gatherServer(server string, query Query, acc telegraf.Accumulator) error {
@@ -166,7 +166,9 @@ func (s *SQLServer) accRow(query Query, acc telegraf.Accumulator, row scanner) e
 
 	if query.ResultByRow {
 		// add measurement to Accumulator
-		acc.Add(measurement, *columnMap["value"], tags, time.Now())
+		acc.AddFields(measurement,
+			map[string]interface{}{"value": *columnMap["value"]},
+			tags, time.Now())
 	} else {
 		// values
 		for header, val := range columnMap {
@@ -243,10 +245,10 @@ UNION ALL
 SELECT 'Average pending disk IO', AveragePendingDiskIOCount = (SELECT AVG(pending_disk_io_count) FROM sys.dm_os_schedulers WITH (NOLOCK) WHERE scheduler_id < 255 )
 UNION ALL
 SELECT 'Buffer pool rate (bytes/sec)', BufferPoolRate = (1.0*cntr_value * 8 * 1024) /
-	(SELECT 1.0*cntr_value FROM sys.dm_os_performance_counters  WHERE object_name like '%Buffer Manager%' AND lower(counter_name) = 'Page life expectancy')
+	(SELECT 1.0*cntr_value FROM sys.dm_os_performance_counters  WHERE object_name like '%Buffer Manager%' AND counter_name = 'Page life expectancy')
 FROM sys.dm_os_performance_counters
 WHERE object_name like '%Buffer Manager%'
-AND counter_name = 'database pages'
+AND counter_name = 'Database pages'
 UNION ALL
 SELECT 'Memory grant pending', MemoryGrantPending = cntr_value
 FROM sys.dm_os_performance_counters
@@ -290,8 +292,8 @@ IF OBJECT_ID('tempdb..#clerk') IS NOT NULL
 	DROP TABLE #clerk;
 
 CREATE TABLE #clerk (
-    ClerkCategory nvarchar(64) NOT NULL, 
-    UsedPercent decimal(9,2), 
+    ClerkCategory nvarchar(64) NOT NULL,
+    UsedPercent decimal(9,2),
     UsedBytes bigint
 );
 
@@ -400,6 +402,8 @@ IF OBJECT_ID('tempdb..#baseline') IS NOT NULL
 	DROP TABLE #baseline;
 SELECT
     DB_NAME(mf.database_id) AS database_name ,
+    CAST(mf.size AS BIGINT) as database_size_8k_pages,
+    CAST(mf.max_size AS BIGINT) as database_max_size_8k_pages,
     size_on_disk_bytes ,
 	type_desc as datafile_type,
     GETDATE() AS baselineDate
@@ -435,6 +439,50 @@ FROM #baseline
 WHERE datafile_type = ''ROWS''
 ) as V
 PIVOT(SUM(size_on_disk_bytes) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
+
+UNION ALL
+
+SELECT measurement = ''Rows size (8KB pages)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database size''
+, ' + @ColumnName + '  FROM
+(
+SELECT database_name, database_size_8k_pages
+FROM #baseline
+WHERE datafile_type = ''ROWS''
+) as V
+PIVOT(SUM(database_size_8k_pages) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
+
+UNION ALL
+
+SELECT measurement = ''Log size (8KB pages)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database size''
+, ' + @ColumnName + '  FROM
+(
+SELECT database_name, database_size_8k_pages
+FROM #baseline
+WHERE datafile_type = ''LOG''
+) as V
+PIVOT(SUM(database_size_8k_pages) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
+
+UNION ALL
+
+SELECT measurement = ''Rows max size (8KB pages)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database size''
+, ' + @ColumnName + '  FROM
+(
+SELECT database_name, database_max_size_8k_pages
+FROM #baseline
+WHERE datafile_type = ''ROWS''
+) as V
+PIVOT(SUM(database_max_size_8k_pages) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
+
+UNION ALL
+
+SELECT measurement = ''Logs max size (8KB pages)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database size''
+, ' + @ColumnName + '  FROM
+(
+SELECT database_name, database_max_size_8k_pages
+FROM #baseline
+WHERE datafile_type = ''LOG''
+) as V
+PIVOT(SUM(database_max_size_8k_pages) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
 '
 --PRINT @DynamicPivotQuery
 EXEC sp_executesql @DynamicPivotQuery;
@@ -578,26 +626,22 @@ const sqlDatabaseIO string = `SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 DECLARE @secondsBetween tinyint = 5;
 DECLARE @delayInterval char(8) = CONVERT(Char(8), DATEADD(SECOND, @secondsBetween, '00:00:00'), 108);
-
 IF OBJECT_ID('tempdb..#baseline') IS NOT NULL
 	DROP TABLE #baseline;
 IF OBJECT_ID('tempdb..#baselinewritten') IS NOT NULL
 	DROP TABLE #baselinewritten;
-
 SELECT DB_NAME(mf.database_id) AS databaseName ,
     mf.physical_name,
     divfs.num_of_bytes_read,
     divfs.num_of_bytes_written,
 	divfs.num_of_reads,
 	divfs.num_of_writes,
-    GETDATE() AS baselineDate
+    GETDATE() AS baselinedate
 INTO #baseline
 FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS divfs
 INNER JOIN sys.master_files AS mf ON mf.database_id = divfs.database_id
 	AND mf.file_id = divfs.file_id
-
 WAITFOR DELAY @delayInterval;
-
 ;WITH currentLine AS
 (
 	SELECT DB_NAME(mf.database_id) AS databaseName ,
@@ -607,12 +651,11 @@ WAITFOR DELAY @delayInterval;
 		divfs.num_of_bytes_written,
 		divfs.num_of_reads,
 	    divfs.num_of_writes,
-		GETDATE() AS currentlineDate
+		GETDATE() AS currentlinedate
 	FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS divfs
 	INNER JOIN sys.master_files AS mf ON mf.database_id = divfs.database_id
 			AND mf.file_id = divfs.file_id
 )
-
 SELECT database_name
 , datafile_type
 , num_of_bytes_read_persec = SUM(num_of_bytes_read_persec)
@@ -625,23 +668,21 @@ FROM
 SELECT
   database_name = currentLine.databaseName
 , datafile_type = type_desc
-, num_of_bytes_read_persec = (currentLine.num_of_bytes_read - T1.num_of_bytes_read) / (DATEDIFF(SECOND,baseLineDate,currentLineDate))
-, num_of_bytes_written_persec = (currentLine.num_of_bytes_written - T1.num_of_bytes_written) / (DATEDIFF(SECOND,baseLineDate,currentLineDate))
-, num_of_reads_persec =  (currentLine.num_of_reads - T1.num_of_reads) / (DATEDIFF(SECOND,baseLineDate,currentLineDate))
-, num_of_writes_persec =  (currentLine.num_of_writes - T1.num_of_writes) / (DATEDIFF(SECOND,baseLineDate,currentLineDate))
+, num_of_bytes_read_persec = (currentLine.num_of_bytes_read - T1.num_of_bytes_read) / (DATEDIFF(SECOND,baselinedate,currentlinedate))
+, num_of_bytes_written_persec = (currentLine.num_of_bytes_written - T1.num_of_bytes_written) / (DATEDIFF(SECOND,baselinedate,currentlinedate))
+, num_of_reads_persec =  (currentLine.num_of_reads - T1.num_of_reads) / (DATEDIFF(SECOND,baselinedate,currentlinedate))
+, num_of_writes_persec =  (currentLine.num_of_writes - T1.num_of_writes) / (DATEDIFF(SECOND,baselinedate,currentlinedate))
 FROM currentLine
 INNER JOIN #baseline T1 ON T1.databaseName = currentLine.databaseName
 	AND T1.physical_name = currentLine.physical_name
 ) as T
 GROUP BY database_name, datafile_type
-
 DECLARE @DynamicPivotQuery AS NVARCHAR(MAX)
 DECLARE @ColumnName AS NVARCHAR(MAX), @ColumnName2 AS NVARCHAR(MAX)
 SELECT @ColumnName = ISNULL(@ColumnName + ',','') + QUOTENAME(database_name)
 	FROM (SELECT DISTINCT database_name FROM #baselinewritten) AS bl
 SELECT @ColumnName2 = ISNULL(@ColumnName2 + '+','') + QUOTENAME(database_name)
 	FROM (SELECT DISTINCT database_name FROM #baselinewritten) AS bl
-
 SET @DynamicPivotQuery = N'
 SELECT measurement = ''Log writes (bytes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
@@ -651,9 +692,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''LOG''
 ) as V
 PIVOT(SUM(num_of_bytes_written_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Rows writes (bytes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -662,9 +701,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''ROWS''
 ) as V
 PIVOT(SUM(num_of_bytes_written_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Log reads (bytes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -673,9 +710,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''LOG''
 ) as V
 PIVOT(SUM(num_of_bytes_read_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Rows reads (bytes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -684,9 +719,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''ROWS''
 ) as V
 PIVOT(SUM(num_of_bytes_read_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Log (writes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -695,9 +728,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''LOG''
 ) as V
 PIVOT(SUM(num_of_writes_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Rows (writes/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -706,9 +737,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''ROWS''
 ) as V
 PIVOT(SUM(num_of_writes_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTabl
-
 UNION ALL
-
 SELECT measurement = ''Log (reads/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -717,9 +746,7 @@ FROM #baselinewritten
 WHERE datafile_type = ''LOG''
 ) as V
 PIVOT(SUM(num_of_reads_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
-
 UNION ALL
-
 SELECT measurement = ''Rows (reads/sec)'', servername = REPLACE(@@SERVERNAME, ''\'', '':''), type = ''Database IO''
 , ' + @ColumnName + ', Total = ' + @ColumnName2 + ' FROM
 (
@@ -729,7 +756,6 @@ WHERE datafile_type = ''ROWS''
 ) as V
 PIVOT(SUM(num_of_reads_persec) FOR database_name IN (' + @ColumnName + ')) AS PVTTable
 '
-
 EXEC sp_executesql @DynamicPivotQuery;
 `
 
@@ -818,7 +844,7 @@ FROM (SELECT DISTINCT DatabaseName FROM #Databases) AS bl
 SET @DynamicPivotQuery = N'
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -831,7 +857,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -844,7 +870,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -858,7 +884,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -871,7 +897,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -884,7 +910,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -897,7 +923,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -910,7 +936,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -923,7 +949,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -936,7 +962,7 @@ UNION ALL
 
 SELECT measurement = Measurement, servername = REPLACE(@@SERVERNAME, ''\'', '':'')
 , type = ''Database properties''
-, ' + @ColumnName + ', total FROM
+, ' + @ColumnName + ', Total FROM
 (
 SELECT Measurement, DatabaseName, Value
 , Total = (SELECT SUM(Value) FROM #Databases WHERE Measurement = d.Measurement)
@@ -997,7 +1023,7 @@ CREATE TABLE #PCounters
 	Primary Key(object_name, counter_name, instance_name)
 );
 INSERT #PCounters
-SELECT RTrim(spi.object_name) object_name
+SELECT DISTINCT RTrim(spi.object_name) object_name
 , RTrim(spi.counter_name) counter_name
 , RTrim(spi.instance_name) instance_name
 , spi.cntr_value
@@ -1019,7 +1045,7 @@ CREATE TABLE #CCounters
 	Primary Key(object_name, counter_name, instance_name)
 );
 INSERT #CCounters
-SELECT RTrim(spi.object_name) object_name
+SELECT DISTINCT RTrim(spi.object_name) object_name
 , RTrim(spi.counter_name) counter_name
 , RTrim(spi.instance_name) instance_name
 , spi.cntr_value
@@ -1113,7 +1139,7 @@ DECLARE @w4 TABLE
 )
 DECLARE @w5 TABLE
 (
-	WaitCategory nvarchar(16) NOT NULL,
+	WaitCategory nvarchar(64) NOT NULL,
 	WaitTimeInMs bigint NOT NULL,
 	WaitTaskCount bigint NOT NULL
 )
@@ -1411,16 +1437,16 @@ SELECT
 , type = 'Wait stats'
 ---- values
 , [I/O] = SUM([I/O])
-, [Latch] = SUM([Latch])
-, [Lock] = SUM([Lock])
-, [Network] = SUM([Network])
-, [Service broker] = SUM([Service broker])
-, [Memory] = SUM([Memory])
-, [Buffer] = SUM([Buffer])
+, [Latch] = SUM([LATCH])
+, [Lock] = SUM([LOCK])
+, [Network] = SUM([NETWORK])
+, [Service broker] = SUM([SERVICE BROKER])
+, [Memory] = SUM([MEMORY])
+, [Buffer] = SUM([BUFFER])
 , [CLR] = SUM([CLR])
 , [SQLOS] = SUM([SQLOS])
-, [XEvent] = SUM([XEvent])
-, [Other] = SUM([Other])
+, [XEvent] = SUM([XEVENT])
+, [Other] = SUM([OTHER])
 , [Total] = SUM([I/O]+[LATCH]+[LOCK]+[NETWORK]+[SERVICE BROKER]+[MEMORY]+[BUFFER]+[CLR]+[XEVENT]+[SQLOS]+[OTHER])
 FROM
 (
@@ -1454,16 +1480,16 @@ SELECT
 , type = 'Wait stats'
 ---- values
 , [I/O] = SUM([I/O])
-, [Latch] = SUM([Latch])
-, [Lock] = SUM([Lock])
-, [Network] = SUM([Network])
-, [Service broker] = SUM([Service broker])
-, [Memory] = SUM([Memory])
-, [Buffer] = SUM([Buffer])
+, [Latch] = SUM([LATCH])
+, [Lock] = SUM([LOCK])
+, [Network] = SUM([NETWORK])
+, [Service broker] = SUM([SERVICE BROKER])
+, [Memory] = SUM([MEMORY])
+, [Buffer] = SUM([BUFFER])
 , [CLR] = SUM([CLR])
 , [SQLOS] = SUM([SQLOS])
-, [XEvent] = SUM([XEvent])
-, [Other] = SUM([Other])
+, [XEvent] = SUM([XEVENT])
+, [Other] = SUM([OTHER])
 , [Total] = SUM([I/O]+[LATCH]+[LOCK]+[NETWORK]+[SERVICE BROKER]+[MEMORY]+[BUFFER]+[CLR]+[XEVENT]+[SQLOS]+[OTHER])
 FROM
 (

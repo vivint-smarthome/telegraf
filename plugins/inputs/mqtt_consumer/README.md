@@ -13,6 +13,8 @@ The plugin expects messages in the
   servers = ["localhost:1883"]
   ## MQTT QoS, must be 0, 1, or 2
   qos = 0
+  ## Connection timeout for initial connection in seconds
+  connection_timeout = "30s"
 
   ## Topics to subscribe to
   topics = [
@@ -40,7 +42,7 @@ The plugin expects messages in the
   # insecure_skip_verify = false
 
   ## Data format to consume.
-  ## Each data format has it's own unique set of configuration options, read
+  ## Each data format has its own unique set of configuration options, read
   ## more about them here:
   ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
   data_format = "influx"
