@@ -3,6 +3,7 @@ package rabbitmq
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -11,17 +12,18 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"net/url"
 )
 
-// DefaultUsername will set a default value that corrasponds to the default
+// DefaultUsername will set a default value that corresponds to the default
 // value used by Rabbitmq
 const DefaultUsername = "guest"
 
-// DefaultPassword will set a default value that corrasponds to the default
+// DefaultPassword will set a default value that corresponds to the default
 // value used by Rabbitmq
 const DefaultPassword = "guest"
 
-// DefaultURL will set a default value that corrasponds to the default value
+// DefaultURL will set a default value that corresponds to the default value
 // used by Rabbitmq
 const DefaultURL = "http://localhost:15672"
 
@@ -134,7 +136,7 @@ type Node struct {
 }
 
 // gatherFunc ...
-type gatherFunc func(r *RabbitMQ, acc telegraf.Accumulator)
+type gatherFunc func(r *RabbitMQ, acc telegraf.Accumulator, url string)
 
 var gatherFunctions = []gatherFunc{gatherOverview, gatherNodes, gatherQueues}
 
@@ -201,24 +203,44 @@ func (r *RabbitMQ) Gather(acc telegraf.Accumulator) error {
 		}
 	}
 
+	parts, err := url.Parse(r.URL)
+	if err != nil {
+		return err
+	}
+	ips, err := net.LookupHost(parts.Hostname())
+	if err != nil {
+		return err
+	}
+	var UseUrl = true
+	if len(ips) > 1 {
+		UseUrl = false
+	}
+
 	var wg sync.WaitGroup
-	wg.Add(len(gatherFunctions))
-	for _, f := range gatherFunctions {
-		go func(gf gatherFunc) {
-			defer wg.Done()
-			gf(r, acc)
-		}(f)
+	for _, ip := range ips {
+		wg.Add(len(gatherFunctions))
+		fmt.Printf("=======> gathering on [%s]\n", ip)
+		for _, f := range gatherFunctions {
+			go func(gf gatherFunc) {
+				defer wg.Done()
+				if UseUrl {
+					gf(r, acc, r.URL)
+				} else {
+					gf(r, acc, fmt.Sprintf("%s://%s:%s", parts.Scheme, ip, parts.Port()))
+				}
+			}(f)
+		}
 	}
 	wg.Wait()
 
 	return nil
 }
 
-func (r *RabbitMQ) requestJSON(u string, target interface{}) error {
-	if r.URL == "" {
-		r.URL = DefaultURL
+func (r *RabbitMQ) requestJSON(url string, u string, target interface{}) error {
+	if url == "" {
+		url = DefaultURL
 	}
-	u = fmt.Sprintf("%s%s", r.URL, u)
+	u = fmt.Sprintf("%s%s", url, u)
 
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
@@ -249,10 +271,10 @@ func (r *RabbitMQ) requestJSON(u string, target interface{}) error {
 	return nil
 }
 
-func gatherOverview(r *RabbitMQ, acc telegraf.Accumulator) {
+func gatherOverview(r *RabbitMQ, acc telegraf.Accumulator, url string) {
 	overview := &OverviewResponse{}
 
-	err := r.requestJSON("/api/overview", &overview)
+	err := r.requestJSON(url, "/api/overview", &overview)
 	if err != nil {
 		acc.AddError(err)
 		return
@@ -263,7 +285,7 @@ func gatherOverview(r *RabbitMQ, acc telegraf.Accumulator) {
 		return
 	}
 
-	tags := map[string]string{"url": r.URL}
+	tags := map[string]string{"url": url}
 	if r.Name != "" {
 		tags["name"] = r.Name
 	}
@@ -283,10 +305,10 @@ func gatherOverview(r *RabbitMQ, acc telegraf.Accumulator) {
 	acc.AddFields("rabbitmq_overview", fields, tags)
 }
 
-func gatherNodes(r *RabbitMQ, acc telegraf.Accumulator) {
+func gatherNodes(r *RabbitMQ, acc telegraf.Accumulator, url string) {
 	nodes := make([]Node, 0)
 	// Gather information about nodes
-	err := r.requestJSON("/api/nodes", &nodes)
+	err := r.requestJSON(url, "/api/nodes", &nodes)
 	if err != nil {
 		acc.AddError(err)
 		return
@@ -298,7 +320,7 @@ func gatherNodes(r *RabbitMQ, acc telegraf.Accumulator) {
 			continue
 		}
 
-		tags := map[string]string{"url": r.URL}
+		tags := map[string]string{"url": url}
 		tags["node"] = node.Name
 
 		fields := map[string]interface{}{
@@ -318,10 +340,10 @@ func gatherNodes(r *RabbitMQ, acc telegraf.Accumulator) {
 	}
 }
 
-func gatherQueues(r *RabbitMQ, acc telegraf.Accumulator) {
+func gatherQueues(r *RabbitMQ, acc telegraf.Accumulator, url string) {
 	// Gather information about queues
 	queues := make([]Queue, 0)
-	err := r.requestJSON("/api/queues", &queues)
+	err := r.requestJSON(url, "/api/queues", &queues)
 	if err != nil {
 		acc.AddError(err)
 		return
@@ -332,7 +354,7 @@ func gatherQueues(r *RabbitMQ, acc telegraf.Accumulator) {
 			continue
 		}
 		tags := map[string]string{
-			"url":         r.URL,
+			"url":         url,
 			"queue":       queue.Name,
 			"vhost":       queue.Vhost,
 			"node":        queue.Node,
